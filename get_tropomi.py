@@ -7,8 +7,9 @@ import hashlib
 import logging
 import os
 import re
+import requests
+import shutil
 import time
-import urllib3
 
 # Either need to use their API: https://sentinelsat.readthedocs.io/en/stable/install.html
 # or try requests - urllib3 doesn't like spaces in the URL
@@ -52,29 +53,26 @@ def find_tags(xml, tag, start_at=0):
     return tagged_lines
 
 
-def get_url(url, username, password, pool, tries=5, **kws):
-    header = urllib3.make_headers(basic_auth='{}:{}'.format(username, password))
+def get_url(url, username, password, tries=5, **kws):
     logger.info('Requesting %s', url)
-    r = pool.request('GET', url, headers=header, **kws)
+    r = requests.get(url, auth=(username, password), **kws)
     n = 1
-    while r.status != 200 and n < tries:
+    while r.status_code != 200 and n < tries:
         logger.warning('Request failed with status %d, waiting 30 sec before trying again', r.status)
         time.sleep(30)
-        r = pool.request('GET', url, headers=header)
+        r = requests.get(url, auth=(username, password), **kws)
         n += 1
         
-    if r.status != 200:
+    if r.status_code != 200:
         raise HTTPError('Failed to return query after {} attempts'.format(n))
         
     return r
 
 
-def build_product_list_for_date(date, query_args, username, password, pool=None, tries=5):
+def build_product_list_for_date(date, query_args, username, password, tries=5):
     query = build_query(date, **query_args)
-    if pool is None:
-        pool = urllib3.PoolManager(ca_certs=certifi.where())
-    r = get_url(query, username, password, pool)
-    xml = r.data.decode('utf8')
+    r = get_url(query, username, password)
+    xml = r.text
     return extract_products(xml)
 
 
@@ -88,7 +86,21 @@ def extract_products(xml):
     filenames = find_tags(xml, '<title>', 1)
     filenames = [re.search('(?<=\<title\>).+(?=\</title\>)', x).group() for x in filenames]
     
-    return [{'id': i, 'link': l, 'file': f} for i, l, f in zip(ids, links, filenames)]
+    return sorted([{'id': i, 'link': l, 'file': f} for i, l, f in zip(ids, links, filenames)], key=lambda x: x['file'])
+
+
+def build_failed_list(failed_list_file, cfg):
+    hub = cfg['hub']
+    failed_list = []
+    with open(failed_list_file) as f:
+        for line in f:
+            filename, product_id, md5 = [x.strip() for x in line.split()]
+            link, _ = build_product_url(hub, product_id)
+            failed_list.append({'id': product_id, 'link': link, 'file': filename})
+
+    return failed_list
+            
+
 
 def build_product_url(hub, product_id):
     root = "{hub}/odata/v1/Products('{prod_id}')".format(hub=hub, prod_id=product_id)
@@ -135,7 +147,7 @@ def _compute_hash(filename):
     return chksum.hexdigest()
 
 
-def download_product_file(product_id, output_name, cfg, pool=None):
+def download_product_file(product_id, output_name, cfg):
     hub = cfg['hub']
     username = cfg['username']
     password = cfg['password']
@@ -145,23 +157,21 @@ def download_product_file(product_id, output_name, cfg, pool=None):
     log_block_size = cfg.get('log_block_size', '10M')
     
     data_url, md5_url = build_product_url(hub, product_id)
-    if pool is None:
-        pool = urllib3.PoolManager(ca_certs=certifi.where())
         
-    r_md5 = get_url(md5_url, username, password, pool, tries=tries)
-    true_md5 = r_md5.data.lower().decode('utf8')
+    r_md5 = get_url(md5_url, username, password, tries=tries)
+    true_md5 = r_md5.text.lower()
     block_size = _convert_block_size(block_size)
     log_block_size = _convert_block_size(log_block_size)
     
     n = 0
     last_log = 0
     while n < tries:
+        r_data = get_url(data_url, username, password, tries=tries, stream=True)
         wobj = open(output_name, 'wb')
-        r_data = get_url(data_url, username, password, pool, tries=tries, preload_content=False)
 
         try:
             bytes_downloaded = 0
-            for chunk in r_data.stream(block_size):
+            for chunk in r_data.iter_content(chunk_size=block_size):
                 wobj.write(chunk)
                 
                 bytes_downloaded += len(chunk)
@@ -173,7 +183,6 @@ def download_product_file(product_id, output_name, cfg, pool=None):
         else:
             logger.info('COMPLETE: %s downloaded for %s', _pretty_bytes(bytes_downloaded), output_name)
         finally:
-            r_data.release_conn()
             wobj.close()
             n += 1
             
@@ -207,13 +216,12 @@ def single_download_driver(product_id, output_name, cfg):
 def multi_download_driver(start_date, end_date, cfg):
     query_args = {k: cfg[k] for k in ('hub', 'product', 'platform', 'mode')}
     curr_date = start_date
-    pool = urllib3.PoolManager(ca_certs=certifi.where())
 
     with open(cfg['record_file'], 'w') as recobj:
         while curr_date <= end_date:
             products_list = build_product_list_for_date(curr_date, query_args=query_args, 
                                                         username=cfg['username'], password=cfg['password'],
-                                                        pool=pool, tries=cfg['num_tries'])
+                                                        tries=cfg['num_tries'])
             for file_info in products_list:
                 outname = os.path.join(cfg['output_dir'], file_info['file'])
                 result, true_md5 = download_product_file(product_id=file_info['id'], output_name=outname, cfg=cfg)
@@ -221,6 +229,22 @@ def multi_download_driver(start_date, end_date, cfg):
                     _record_failed_download(recobj, outname, file_info['id'], true_md5)
                 
             curr_date += dt.timedelta(days=1)
+
+
+def failed_redownload_driver(failed_list_file, cfg):
+    failed_list = build_failed_list(failed_list_file, cfg)
+    if failed_list_file == cfg['record_file']:
+        logger.warning('Backing up list of failed files (%s) as it will be overwritten with new downloads', failed_list_file)
+        new_name = '{}.bak.{}'.format(failed_list_file, dt.datetime.now().strftime('%Y%m%dT%H%M%S'))
+        shutil.copy2(failed_list_file, new_name)
+    
+    with open(cfg['record_file'], 'w') as recobj:
+        for file_info in failed_list:
+            outname = os.path.join(cfg['output_dir'], file_info['file'])
+            result, true_md5 = download_product_file(product_id=file_info['id'], output_name=outname, cfg=cfg)
+            if not result:
+                _record_failed_download(recobj, outname, file_info['id'], true_md5)
+
 
 
 def create_demo_config(config_file):
@@ -291,6 +315,14 @@ def parse_dlbatch_args(p):
     p.set_defaults(driver=multi_download_driver)
 
 
+def parse_dlfailed_args(p):
+    p.description = 'Redownload TROPOMI files whose checksums did not match'
+    p.add_argument('config_file', help='Path to an INI-style config file that has the common download options')
+    p.add_argument('section', help='Section of the config with the settings to use to download')
+    p.add_argument('failed_list_file', help='Path to a "failed_downloads" file that has the file name, file ID, and MD5 sum of failed files')
+    p.set_defaults(driver=failed_redownload_driver)
+
+
 def parse_top_args():
     p = ArgumentParser(description='Download TROPOMI files')
     p.add_argument('-v', '--verbose', action='store_const', const=2, default=1,
@@ -306,6 +338,9 @@ def parse_top_args():
 
     p_dlbatch = subp.add_parser('dlbatch')
     parse_dlbatch_args(p_dlbatch)
+
+    p_dlfailed = subp.add_parser('dlfailed')
+    parse_dlfailed_args(p_dlfailed)
 
     p_demo = subp.add_parser('make-cfg')
     parse_demo_config_args(p_demo)
@@ -362,6 +397,11 @@ def main():
         config_file = cl_args.pop('config_file')
         section = cl_args.pop('section')
         cfg = read_config_file(config_file, section)
+
+        logger.debug('Configuration read:')
+        for k, v in cfg.items():
+            logger.debug('  {} = {}'.format(k, v))
+
         return driver_fxn(cfg=cfg, **cl_args)
     else:
         return driver_fxn(**cl_args)
