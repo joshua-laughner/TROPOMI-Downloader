@@ -58,7 +58,7 @@ def get_url(url, username, password, tries=5, **kws):
     r = requests.get(url, auth=(username, password), **kws)
     n = 1
     while r.status_code != 200 and n < tries:
-        logger.warning('Request failed with status %d, waiting 30 sec before trying again', r.status)
+        logger.warning('Request failed with status %d, waiting 30 sec before trying again', r.status_code)
         time.sleep(30)
         r = requests.get(url, auth=(username, password), **kws)
         n += 1
@@ -231,6 +231,29 @@ def multi_download_driver(start_date, end_date, cfg):
             curr_date += dt.timedelta(days=1)
 
 
+def check_md5_dates_driver(start_date, end_date, cfg):
+    query_args = {k: cfg[k] for k in ('hub', 'product', 'platform', 'mode')}
+    hub = query_args['hub']
+    curr_date = start_date
+
+    with open(cfg['record_file'], 'w') as recobj:
+        while curr_date <= end_date:
+            products_list = build_product_list_for_date(curr_date, query_args=query_args,
+                                                        username=cfg['username'], password=cfg['password'],
+                                                        tries=cfg['num_tries'])
+
+            for file_info in products_list:
+                outname = os.path.join(cfg['output_dir'], file_info['file'])
+                    
+                data_url, md5_url = build_product_url(hub, file_info['id'])
+                r_md5 = get_url(md5_url, cfg['username'], cfg['password'], tries=cfg['num_tries'])
+                true_md5 = r_md5.text.lower()
+                if not os.path.exists(outname) or true_md5 != _compute_hash(outname):
+                    _record_failed_download(recobj, outname, file_info['id'], true_md5)
+
+            curr_date += dt.timedelta(days=1)
+
+
 def failed_redownload_driver(failed_list_file, cfg):
     failed_list = build_failed_list(failed_list_file, cfg)
     if failed_list_file == cfg['record_file']:
@@ -315,6 +338,15 @@ def parse_dlbatch_args(p):
     p.set_defaults(driver=multi_download_driver)
 
 
+def parse_checkbatch_args(p):
+    p.description = 'Verify TROPOMI files MD5 checksums for a date range'
+    p.add_argument('config_file', help='Path to an INI-style config file that has the common download options')
+    p.add_argument('section', help='Section of the config with the settings to use to download')
+    p.add_argument('start_date', type=_datetype, help='First date to download for, in YYYYMMDD or YYYY-MM-DD format')
+    p.add_argument('end_date', type=_datetype, help='Last date to download for, in YYYYMMDD or YYYY-MM-DD format')
+    p.set_defaults(driver=check_md5_dates_driver)
+
+
 def parse_dlfailed_args(p):
     p.description = 'Redownload TROPOMI files whose checksums did not match'
     p.add_argument('config_file', help='Path to an INI-style config file that has the common download options')
@@ -341,6 +373,9 @@ def parse_top_args():
 
     p_dlfailed = subp.add_parser('dlfailed')
     parse_dlfailed_args(p_dlfailed)
+
+    p_dlcheck = subp.add_parser('check-by-dates', aliases=['cbd'])
+    parse_checkbatch_args(p_dlcheck)
 
     p_demo = subp.add_parser('make-cfg')
     parse_demo_config_args(p_demo)
