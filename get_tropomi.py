@@ -39,7 +39,9 @@ def build_query(date, hub, product, platform, mode):
     urlfmt = '{hub}/search?q=beginPosition:[{start} TO {stop}] AND platformname:{platform} AND producttype:{product} AND processingmode:{mode}&rows=50&start=0'
     start = date.strftime('%Y-%m-%dT00:00:00.000Z')
     stop = date.strftime('%Y-%m-%dT23:59:59.000Z')
-    return urlfmt.format(hub=hub, start=start, stop=stop, platform=platform, product=product, mode=mode)
+    # Having an extra "/" at the end of the main URL, e.g. before "odata" in "https://s5phub.copernicus.eu/dhus//odata" 
+    # seems to cause 404 errors. Rstripping any '/' from the hub will fix that.
+    return urlfmt.format(hub=hub.rstrip('/'), start=start, stop=stop, platform=platform, product=product, mode=mode)
 
 
 def find_tags(xml, tag, start_at=0):
@@ -103,7 +105,7 @@ def build_failed_list(failed_list_file, cfg):
 
 
 def build_product_url(hub, product_id):
-    root = "{hub}/odata/v1/Products('{prod_id}')".format(hub=hub, prod_id=product_id)
+    root = "{hub}/odata/v1/Products('{prod_id}')".format(hub=hub.rstrip('/'), prod_id=product_id)
     data_url = "{}/$value".format(root)
     md5_url = '{}/Checksum/Value/$value'.format(root)
     return data_url, md5_url
