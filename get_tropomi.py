@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from argparse import ArgumentParser
-import certifi
+#import certifi
 import configparser
 import datetime as dt
 import hashlib
